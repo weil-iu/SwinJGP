@@ -1,8 +1,10 @@
 # SwinJGP
 Pytorch Implementation of "Learning-based Joint Geometric-Probabilistic Shaping for Digital Semantic Communication"
-# Installation
+## Installation
 Python 3.9<br>
 CUDA 12.4
+## Requirements
+
 ## Training & Evaluation
 For training, run the following command (as an example):
 ``` 
