@@ -1,0 +1,120 @@
+from net.modules import *
+
+class Encoder(nn.Module):
+    def __init__(self, C):
+        super(Encoder, self).__init__()
+        image_dims = (3, 32, 32)
+        self.H = self.W = 32
+        encoder_kwargs = dict(
+            img_size=(image_dims[1], image_dims[2]), patch_size=2, in_chans=3,
+            embed_dims=[128, 256], depths=[2, 4], num_heads=[4, 8], C=C,
+            window_size=2, mlp_ratio=4., qkv_bias=True, qk_scale=None,
+            norm_layer=nn.LayerNorm, patch_norm=True,
+        )
+        self.encoder = SwinEncoder(**encoder_kwargs)
+
+    def forward(self, input_image):
+        self.encoder.update_resolution(self.H, self.W)
+        feature = self.encoder(input_image)
+        return feature # B * 64 * C
+
+class SwinEncoder(nn.Module):
+    def __init__(self, img_size, patch_size, in_chans,
+                 embed_dims, depths, num_heads, C,
+                 window_size=4, mlp_ratio=4., qkv_bias=True, qk_scale=None,
+                 norm_layer=nn.LayerNorm, patch_norm=True,
+                 bottleneck_dim=16):
+        super().__init__()
+        self.num_layers = len(depths)
+        self.patch_norm = patch_norm
+        self.num_features = bottleneck_dim
+        self.mlp_ratio = mlp_ratio
+        self.embed_dims = embed_dims
+        self.in_chans = in_chans
+        self.patch_size = patch_size
+        self.patches_resolution = img_size
+        self.H = img_size[0] // (2 ** self.num_layers)
+        self.W = img_size[1] // (2 ** self.num_layers)
+        self.patch_embed = PatchEmbed(img_size, 2, 3, embed_dims[0])
+        self.sigmoid = nn.Sigmoid()
+
+        # build layers
+        self.layers = nn.ModuleList()
+        for i_layer in range(self.num_layers):
+            layer = BasicLayer(dim=int(embed_dims[i_layer - 1]) if i_layer != 0 else 3,
+                               out_dim=int(embed_dims[i_layer]),
+                               input_resolution=(self.patches_resolution[0] // (2 ** i_layer),
+                                                 self.patches_resolution[1] // (2 ** i_layer)),
+                               depth=depths[i_layer],
+                               num_heads=num_heads[i_layer],
+                               window_size=window_size,
+                               mlp_ratio=self.mlp_ratio,
+                               qkv_bias=qkv_bias, qk_scale=qk_scale,
+                               norm_layer=norm_layer,
+                               downsample=PatchMerging if i_layer != 0 else None)
+            self.layers.append(layer)
+        self.norm = norm_layer(embed_dims[-1])
+        self.head_list = nn.Linear(embed_dims[-1], C)
+        self.apply(self._init_weights)
+
+    def forward(self, x):
+        x = self.patch_embed(x)
+        for _, layer in enumerate(self.layers):
+            x = layer(x)
+        x = self.norm(x)
+        x = self.head_list(x)
+        return x
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def update_resolution(self, H, W):
+        self.input_resolution = (H, W)
+        for i_layer, layer in enumerate(self.layers):
+            layer.update_resolution(H // (2 ** (i_layer + 1)),
+                                    W // (2 ** (i_layer + 1)))
+
+class BasicLayer(nn.Module):
+    def __init__(self, dim, out_dim, input_resolution, depth, num_heads, window_size,
+                 mlp_ratio=4., qkv_bias=True, qk_scale=None, norm_layer=nn.LayerNorm,
+                 downsample=None):
+
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.depth = depth
+        self.blocks = nn.ModuleList([
+            SwinTransformerBlock(dim=out_dim,
+                                 input_resolution=(input_resolution[0] // 2, input_resolution[1] // 2),
+                                 num_heads=num_heads, window_size=window_size,
+                                 shift_size=0 if (i % 2 == 0) else window_size // 2,
+                                 mlp_ratio=mlp_ratio,
+                                 qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                 norm_layer=norm_layer)
+            for i in range(depth)])
+
+        # patch merging layer
+        if downsample is not None:
+            self.downsample = downsample(input_resolution, dim=dim, out_dim=out_dim, norm_layer=norm_layer)
+        else:
+            self.downsample = None
+
+    def forward(self, x):
+        if self.downsample is not None:
+            x = self.downsample(x)
+        for _, blk in enumerate(self.blocks):
+            x = blk(x)
+        return x
+
+    def update_resolution(self, H, W):
+        for _, blk in enumerate(self.blocks):
+            blk.input_resolution = (H, W)
+            blk.update_mask()
+        if self.downsample is not None:
+            self.downsample.input_resolution = (H * 2, W * 2)
